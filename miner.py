@@ -2,13 +2,31 @@ import os
 import sys
 import pathlib
 from subprocess import call
-from typing import List
 from cli import cmdline_args
+from utils import clear_directory, clear_projects
+
+
+def clear(args):
+    removed = clear_directory(args.output_dir)
+    if args.projects:
+        removed += clear_projects()
+    for path in removed:
+        print(f"Removed {path}")
+    print(f"Clear finished: {len(removed)} item(s) removed")
+
+# clear runs before the imports below: it needs none of the parsers, and loading them
+# is slow and prints a tree-sitter FutureWarning
+if __name__ == "__main__":
+    args = cmdline_args()
+    if args.command == 'clear':
+        clear(args)
+        sys.exit(0)
+
 import pandas as pd
 from pydriller import Git
 from tqdm import tqdm
 
-from utils import create_logger, dictionary
+from utils import create_logger, dictionary, to_utf8
 import json
 
 from miner_py_src.java import tree_sitter_java, exception, miner_java_utils
@@ -16,11 +34,17 @@ from miner_py_src.java import stats as java_stats
 from miner_py_src.python import tree_sitter_py, exceptions, miner_py_utils
 from miner_py_src.python import stats as python_stats
 from miner_py_src.python.call_graph import CFG, generate_cfg
+from miner_py_src.python.exceptions import CallGraphError
 from miner_py_src.typescript import tree_sitter_ts, exceptions, miner_ts_utils
 from miner_py_src.typescript import stats as ts_stats
-from multiprocessing import Process
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from multiprocessing import Pool, Process
 
 logger = create_logger("exception_miner", "exception_miner.log")
+
+# files sent to a pool worker at a time: fewer round trips, still balanced across workers
+PARSE_CHUNKSIZE = 4
 
 
 MODULES = {
@@ -70,16 +94,18 @@ def fetch_repositories(project, repo, language, args)->list[str]:
 
     mainExtension = language["main"]
 
-    if not os.path.exists(f"{args.output_dir}/pytlint"):
-        os.makedirs(f"{args.output_dir}/pytlint")
-
-    if not os.path.exists(f"{args.output_dir}/pytlint/{project}"):
-        os.mkdir(f"{args.output_dir}/pytlint/{project}")
+    # exist_ok: the language processes create these folders at the same time
+    os.makedirs(f"{args.output_dir}/pytlint/{project}", exist_ok=True)
 
     try:
         path = os.path.join(os.getcwd(), f"projects/{mainExtension}", str(project))
-        git_cmd = "git clone {}.git --recursive {}".format(repo, path)
-        call(git_cmd, shell=True)
+        if os.path.exists(os.path.join(path, ".git")):
+            logger.warning(
+                "Exception Miner: {} already cloned in {}, skipping clone".format(project, path))
+        else:
+            # only the checked out files are read, never the history: a shallow clone is enough
+            git_cmd = "git clone --depth 1 {}.git --recursive {}".format(repo, path)
+            call(git_cmd, shell=True)
         logger.warning(
             "Exception Miner: Before init git repo: {}".format(project))
         gr = Git(path)
@@ -106,7 +132,53 @@ def __get_method_name(node):  # -> str | None:
         if child.type == 'identifier' or child.type == 'object_pattern':
             return child.text.decode("utf-8")
 
-def collect_parser(files, project_name, language, args):
+def init_language(main_extension):
+    # set in every process that parses files: the miner process and each pool worker
+    global parser, get_function_defs, FunctionDefNotFoundException, FileStats
+    module = MODULES[main_extension]
+
+    parser = module["tree_sitter"].parser
+    get_function_defs = module["utils"].get_function_defs
+    FunctionDefNotFoundException = module["exception"].FunctionDefNotFoundException
+    FileStats = module["stats"].FileStats
+
+def parse_file(file_path):
+    # runs in the pool workers: returns plain data only, tree-sitter nodes can't be pickled
+    rows = []
+    with open(file_path, "rb") as file:
+        try:
+            content = file.read()
+        except UnicodeDecodeError as ex:
+            tqdm.write(
+                f"###### UnicodeDecodeError Error!!! file: {file_path}.\n{str(ex)}"
+            )
+            return rows
+    content = to_utf8(content)
+    try:
+        tree = parser.parse(content)
+    except SyntaxError as ex:
+        tqdm.write(
+            f"###### SyntaxError Error!!! file: {file_path}.\n{str(ex)}")
+    else:
+        file_stats = FileStats()
+        captures = get_function_defs(tree)
+        for child in captures:
+            function_identifier = __get_method_name(child)
+            if function_identifier is None:
+                raise FunctionDefNotFoundException(
+                    f'Function identifier not found:\n {child.text}')
+
+            metrics = file_stats.get_metrics(child)
+            rows.append({
+                "file": file_path,
+                "function": function_identifier,
+                "func_body": child.text.decode("utf-8"),
+                'str_uncaught_exceptions': '',
+                **metrics
+            })
+    return rows
+
+def collect_parser(files, project_name, language, args, pool=None):
     columnsLanguage = {
         "py": ["file", "function", "func_body", "str_uncaught_exceptions", "n_try_except", "n_try_pass", "n_finally",
                  "n_generic_except", "n_raise", "n_captures_broad_raise", "n_captures_try_except_raise", "n_captures_misplaced_bare_raise",
@@ -118,58 +190,22 @@ def collect_parser(files, project_name, language, args):
         "java": ["file", "function", "func_body", 'n_try_catch_java', 'n_finally_java', 'str_catch_identifiers_java', 'str_catch_block_java', 'n_generic_catch_java', 'n_useless_catch_java', 'n_wrapped_catch_java', 'n_count_empty_catch_java', 'n_count_catch_reassigning_identifier_java', 'str_throw_identifiers_java', 'n_throw_java', 'n_generic_throw_java', 'n_non_generic_throw_java', 'n_captures_try_catch_throw_java', 'n_try_return_java', 'n_nested_try_java', 'throw_within_finally_java', 'throwing_null_pointer_exception_java', 'generic_exception_handling_java', 'instanceof_in_catch_java', 'n_instanceof_in_catch_java', 'destructive_wrapping_java', 'cause_in_catch_java', 'n_cout_get_cause_in_catch_java' ]
     }
 
-    df = pd.DataFrame(
-        columns=columnsLanguage[language["main"]]
-    )
+    columns = columnsLanguage[language["main"]]
 
-    file_stats = FileStats()
-    pbar = tqdm(files)
-    func_defs: List[str] = []  # List[Node] = []
-    for file_path in pbar:
+    # files are parsed in parallel by the pool; imap keeps the results in the order of files
+    if pool is None:
+        results = map(parse_file, files)
+    else:
+        results = pool.imap(parse_file, files, chunksize=PARSE_CHUNKSIZE)
+    pbar = tqdm(zip(files, results), total=len(files))
+    # rows are collected and turned into a DataFrame once: a pd.concat per function is O(n^2)
+    rows = []
+    for file_path, file_rows in pbar:
         pbar.set_description(f"Processing {str(file_path)[-40:].ljust(40)}")
-
-        with open(file_path, "rb") as file:
-            try:
-                content = file.read()
-            except UnicodeDecodeError as ex:
-                tqdm.write(
-                    f"###### UnicodeDecodeError Error!!! file: {file_path}.\n{str(ex)}"
-                )
-                continue
-        try:
-            tree = parser.parse(content)
-        except SyntaxError as ex:
-            tqdm.write(
-                f"###### SyntaxError Error!!! file: {file_path}.\n{str(ex)}")
-        else:
-            captures = get_function_defs(tree)
-            for child in captures:
-                function_identifier = __get_method_name(child)
-                if function_identifier is None:
-                    raise FunctionDefNotFoundException(
-                        f'Function identifier not found:\n {child.text}')
-
-                func_defs.append(function_identifier)
-                file_stats.metrics(child, file_path)
-                metrics = file_stats.get_metrics(child)
-                df = pd.concat(
-                    [
-                        pd.DataFrame(
-                            [{
-                                "file": file_path,
-                                "function": __get_method_name(child),
-                                "func_body": child.text.decode("utf-8"),
-                                'str_uncaught_exceptions': '',
-                                **metrics                                
-                            }],
-                            columns=df.columns,
-                        ),
-                        df,
-                    ],
-                    ignore_index=True,
-                )
-    file_stats.num_files += len(files)
-    file_stats.num_functions += len(func_defs)
+        rows.extend(file_rows)
+    # newest row first, as the old prepend-concat did (the call graph lookup takes the first match).
+    # dtype=object keeps values as returned (no int -> float coercion), like the concat did
+    df = pd.DataFrame(rows[::-1], columns=columns, dtype=object)
 
     if language["main"] == 'py':
         #Call graph for python projects
@@ -177,9 +213,14 @@ def collect_parser(files, project_name, language, args):
 
         #!!!!!!!!!!!!!!!!!!
         mainExtension = language["main"]
-        call_graph = generate_cfg(str(project_name), os.path.normpath(
-            f"projects/{mainExtension}/{str(project_name)}"), args.output_dir)
-        
+        try:
+            call_graph = generate_cfg(str(project_name), os.path.normpath(
+                f"projects/{mainExtension}/{str(project_name)}"), args.output_dir)
+        except CallGraphError as ex:
+            logger.warning(
+                f"Exception Miner: call graph failed for {project_name}, continuing without it: {ex}")
+            call_graph = None
+
         if call_graph is None:
             call_graph = {}
 
@@ -264,28 +305,34 @@ def check_language(languages):
             raise Exception(f"This language isn't in our dataset. Please, select any of these: {', '.join(list(dictionary.keys()))}")
     return results
 
-def process_language(language, args):
-    global parser, get_function_defs, FunctionDefNotFoundException, FileStats
-    module = MODULES[language['main']]
+def process_language(language, args, jobs=1):
+    init_language(language['main'])
 
-    parser = module["tree_sitter"].parser
-    get_function_defs = module["utils"].get_function_defs
-    FunctionDefNotFoundException = module["exception"].FunctionDefNotFoundException
-    FileStats = module["stats"].FileStats
+    projects = [row for _, row in pd.read_csv(args.input_path, sep=",").iterrows()]
+    workers = (Pool(jobs, initializer=init_language, initargs=(language['main'],))
+               if jobs > 1 else nullcontext())
+    # one thread clones the next project while the current one is parsed
+    with workers as pool, ThreadPoolExecutor(max_workers=1) as cloner:
+        def fetch(row):
+            return cloner.submit(fetch_repositories, row['name'], row['repo'], language, args)
 
-    projects = pd.read_csv(args.input_path, sep=",")
-    for index, row in projects.iterrows():
-        files = fetch_repositories(row['name'],row['repo'], language, args)
-        if len(files) > 0:
-            collect_parser(files, row['name'], language, args)
+        next_files = fetch(projects[0]) if projects else None
+        for index, row in enumerate(projects):
+            files = next_files.result()
+            if index + 1 < len(projects):
+                next_files = fetch(projects[index + 1])
+            if len(files) > 0:
+                collect_parser(files, row['name'], language, args, pool)
 
 if __name__ == "__main__":
-    args = cmdline_args()
+    # args were parsed at the top of the file
     languages = check_language(args.language)
+    # the languages run at the same time: split the parser workers among them
+    jobs = max(1, args.jobs // len(languages))
 
     processes = []
     for language in languages:
-        p = Process(target=process_language, args=(language, args))
+        p = Process(target=process_language, args=(language, args, jobs))
         p.start()
         processes.append(p)
 

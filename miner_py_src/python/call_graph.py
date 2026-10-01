@@ -1,18 +1,39 @@
-import glob
 import json
 import os
 import subprocess
+import sys
 
 from tqdm import tqdm
 
 from miner_py_src.python.exceptions import CallGraphError
 
+# PyCG's import hook turns every module first imported during the analysis into an
+# empty stub. CPython imports unicodedata to normalize non-ASCII identifiers, so a
+# stubbed one breaks ast.parse ("module 'unicodedata' has no attribute 'normalize'").
+PYCG_LAUNCHER = ("import sys, unicodedata; from pycg.__main__ import main; "
+                 "sys.argv[0] = 'pycg'; main()")
+
+def list_python_files(root):
+    # os.walk does not follow directory symlinks. glob's '**' does and never ends on
+    # self-referencing links (e.g. bup's Documentation/man1 -> .)
+    python_files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # skip hidden entries, like glob does
+        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+        for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            if (filename.endswith('.py') and not filename.startswith('.')
+                    and os.path.isfile(path) and not os.path.islink(path)):
+                python_files.append(os.path.abspath(path))
+    return python_files
+
 def generate_cfg(project_name, project_folder, output_dir):
     current_path = os.getcwd()
     os.makedirs(
         f'{current_path}/{output_dir}/call_graph/{project_name}', exist_ok=True)
-    os.chdir(os.path.normpath(os.path.join(project_folder)))
-
+    # no os.chdir: the cwd is shared by the whole process (the next project is cloned by
+    # another thread meanwhile), so PyCG gets the project folder as its own cwd instead
+    project_path = os.path.normpath(project_folder)
     tqdm.write(f"Generating call graph for {project_name}...")
 
     # python_src_files = [os.path.abspath(x)
@@ -22,9 +43,7 @@ def generate_cfg(project_name, project_folder, output_dir):
 
     #python_src_files = project_src_base
 
-    python_src_files = [os.path.abspath(x)
-                        for x in glob.iglob("./**/*.py", recursive=True)
-                        if os.path.isfile(x)]
+    python_src_files = list_python_files(project_path)
 
     if len(python_src_files) == 0:
         raise CallGraphError("No python files found")
@@ -33,7 +52,7 @@ def generate_cfg(project_name, project_folder, output_dir):
     tqdm.write('Running PyCG...')
 
     args = [
-        'pycg',
+        sys.executable, '-c', PYCG_LAUNCHER,
         *python_src_files[0:4],
         '--package', project_name,
         '--max-iter', '1',
@@ -41,12 +60,12 @@ def generate_cfg(project_name, project_folder, output_dir):
 
     # TODO: Paralelize? (Too Slow Here...)
     proc = subprocess.run(args, stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          stderr=subprocess.PIPE, cwd=project_path)
 
     tqdm.write('PyCG finished')
 
     if (proc.returncode != 0):
-        raise CallGraphError(proc.stderr.decode('utf-8'))
+        raise CallGraphError(proc.stderr.decode('utf-8', errors='replace'))
 
     try:
         open(f'{current_path}/{output_dir}/call_graph/{project_name}/stdout.txt', 'w').write(
@@ -61,8 +80,6 @@ def generate_cfg(project_name, project_folder, output_dir):
     except IOError as e:
         tqdm.write('Could not write stderr.txt')
         tqdm.write(e.strerror)
-
-    os.chdir(current_path)
 
     json_obj = json.load(
         open(f'{current_path}/{output_dir}/call_graph/{project_name}/call_graph.json'))
